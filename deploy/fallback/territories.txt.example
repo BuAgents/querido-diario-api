@@ -1,0 +1,5 @@
+# One IBGE municipality code per line (7 digits). Lines starting with # are ignored.
+# bin/daily.sh crawls every enabled spider that covers at least one of these.
+# Copy to territories.txt and edit; the list comes from pie's subject territories.
+3550308
+3304557

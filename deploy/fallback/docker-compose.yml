@@ -1,0 +1,209 @@
+# Querido Diário self-hosted fallback (scoped mirror).
+#
+# Runs the full pipeline for a chosen list of territories:
+#   spiders (Scrapy) -> object storage (SeaweedFS S3) + Postgres (gazettes table)
+#   -> data-processing (Apache Tika text extraction, themed excerpts) -> OpenSearch
+#   -> querido-diario-api (read layer, same API shape as api.queridodiario.ok.org.br)
+#
+# Only the API (8080) and the S3 read endpoint (8333) are published, and only on
+# QD_BIND_ADDR (a private-network / VPN address). OpenSearch, Postgres and Tika
+# are reachable on the internal compose network only.
+#
+# Long-running services start with `docker compose up -d`. The `spiders` and
+# `processing` services are jobs (profile "jobs"), started by bin/daily.sh and
+# bin/backfill.sh, normally from the systemd timer that bin/setup.sh installs.
+#
+# Sizing knobs live in .env (see .env.example): OPENSEARCH_HEAP and the *_MEM limits.
+
+name: qd-fallback
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-2.19.6}
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - path.repo=/usr/share/opensearch/snapshots
+      - "OPENSEARCH_JAVA_OPTS=-Xms${OPENSEARCH_HEAP:-2g} -Xmx${OPENSEARCH_HEAP:-2g}"
+      # The security plugin is off because OpenSearch is never published outside
+      # the internal compose network. Do not add a `ports:` entry to this service.
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    mem_limit: ${OPENSEARCH_MEM:-4g}
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+      - ${QD_BACKUP_DIR:-/srv/qd-fallback/backups}/opensearch:/usr/share/opensearch/snapshots
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    logging: *logging
+
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-17}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: queridodiario
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: queridodiariodb
+    mem_limit: ${POSTGRES_MEM:-1g}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Creates the (empty) companies database the API expects. CNPJ data is not
+      # loaded: /company/* endpoints will return empty results on the fallback.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queridodiario -d queridodiariodb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  storage:
+    # MinIO's community edition is archived (no more images or security fixes),
+    # so the S3 store is SeaweedFS (Apache-2.0). Only boto3/botocore talk to it.
+    image: chrislusf/seaweedfs:${SEAWEEDFS_VERSION:-4.48}
+    restart: unless-stopped
+    command: >
+      server -dir=/data -ip.bind=0.0.0.0 -master.volumeSizeLimitMB=1024
+      -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    mem_limit: ${STORAGE_MEM:-1g}
+    volumes:
+      - storage_data:/data
+      - ./config/s3.json:/etc/seaweedfs/s3.json:ro
+    ports:
+      # Read access for gazette file_url / txt_url links returned by the API.
+      - "${QD_BIND_ADDR:-127.0.0.1}:8333:8333"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9333/cluster/status >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    logging: *logging
+
+  tika:
+    # Same Tika line the data-processing repo builds (3.3.x, no OCR).
+    image: apache/tika:${TIKA_VERSION:-3.3.1.0}
+    restart: unless-stopped
+    environment:
+      # Tika server forks a child JVM; cap each at 40% of the container limit.
+      - JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=40
+    mem_limit: ${TIKA_MEM:-2g}
+    cpus: ${TIKA_CPUS:-2}
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9998"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *logging
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: qd-fallback/api:local
+    restart: unless-stopped
+    depends_on:
+      opensearch: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    env_file:
+      - ../../config/sample.env
+    environment:
+      - QUERIDO_DIARIO_OPENSEARCH_HOST=http://opensearch:9200
+      - QUERIDO_DIARIO_FILES_ENDPOINT=${QD_PUBLIC_FILES_ENDPOINT:-http://127.0.0.1:8333/queridodiariobucket/}
+      - POSTGRES_COMPANIES_HOST=postgres
+      - POSTGRES_COMPANIES_DB=companies
+      - POSTGRES_COMPANIES_USER=queridodiario
+      - POSTGRES_COMPANIES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_AGGREGATES_HOST=postgres
+      - POSTGRES_AGGREGATES_DB=queridodiariodb
+      - POSTGRES_AGGREGATES_USER=queridodiario
+      - POSTGRES_AGGREGATES_PASSWORD=${POSTGRES_PASSWORD}
+      # The /scraper/* write endpoints are not used here (spiders write to
+      # Postgres directly); a random key keeps them closed.
+      - QUERIDO_DIARIO_SCRAPER_API_KEYS=${SCRAPER_API_KEY:?set SCRAPER_API_KEY in .env}
+      - QUERIDO_DIARIO_SUGGESTION_MAILJET_REST_API_KEY=
+      - QUERIDO_DIARIO_SUGGESTION_MAILJET_REST_API_SECRET=
+    mem_limit: ${API_MEM:-512m}
+    ports:
+      - "${QD_BIND_ADDR:-127.0.0.1}:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging: *logging
+
+  spiders:
+    profiles: ["jobs"]
+    build:
+      context: .
+      dockerfile: Dockerfile.spiders
+      args:
+        QD_SPIDERS_REF: ${QD_SPIDERS_REF:-c865658114970927df95ce3baa7ae99e833a2ab4}
+    image: qd-fallback/spiders:local
+    depends_on:
+      postgres: { condition: service_healthy }
+      storage: { condition: service_healthy }
+    environment:
+      - QUERIDODIARIO_DATABASE_URL=postgresql://queridodiario:${POSTGRES_PASSWORD}@postgres:5432/queridodiariodb
+      - FILES_STORE=s3://queridodiariobucket/
+      - AWS_ACCESS_KEY_ID=${STORAGE_ACCESS_KEY:?set STORAGE_ACCESS_KEY in .env}
+      - AWS_SECRET_ACCESS_KEY=${STORAGE_ACCESS_SECRET:?set STORAGE_ACCESS_SECRET in .env}
+      - AWS_ENDPOINT_URL=http://storage:8333
+      - AWS_REGION_NAME=us-east-1
+      - SPIDERMON_DISCORD_FAKE=True
+    mem_limit: ${SPIDERS_MEM:-1g}
+    logging: *logging
+
+  processing:
+    profiles: ["jobs"]
+    build:
+      context: https://github.com/okfn-brasil/querido-diario-data-processing.git#${QD_PROCESSING_REF:-c3069787ef4c5c3b5a7469d2d531f3f871b4aa7a}
+      dockerfile: Dockerfile
+    image: qd-fallback/processing:local
+    command: ["python", "-m", "main"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      opensearch: { condition: service_healthy }
+      storage: { condition: service_healthy }
+      tika: { condition: service_healthy }
+    environment:
+      - STORAGE_REGION=us-east-1
+      - STORAGE_ENDPOINT=http://storage:8333
+      - STORAGE_ACCESS_KEY=${STORAGE_ACCESS_KEY}
+      - STORAGE_ACCESS_SECRET=${STORAGE_ACCESS_SECRET}
+      - STORAGE_BUCKET=queridodiariobucket
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=queridodiariodb
+      - POSTGRES_USER=queridodiario
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - OPENSEARCH_HOST=http://opensearch:9200
+      - OPENSEARCH_INDEX=querido-diario
+      - OPENSEARCH_USER=admin
+      - OPENSEARCH_PASSWORD=unused
+      - APACHE_TIKA_SERVER=http://tika:9998
+      - QUERIDO_DIARIO_FILES_ENDPOINT=${QD_PUBLIC_FILES_ENDPOINT:-http://127.0.0.1:8333/queridodiariobucket/}
+      - EXECUTION_MODE=${PROCESSING_MODE:-UNPROCESSED}
+      - MEMORY_LIMIT_BYTES=${PROCESSING_MEM_BYTES:-3221225472}
+      - DEBUG=0
+    mem_limit: ${PROCESSING_MEM:-3g}
+    logging: *logging
+
+volumes:
+  opensearch_data:
+  postgres_data:
+  storage_data:

@@ -1,0 +1,20 @@
+# Builds the okfn-brasil/querido-diario spiders at a pinned commit.
+# Upstream runs them on Scrapy Cloud; here they run as one-off compose jobs.
+FROM python:3.13-slim
+
+ARG QD_SPIDERS_REF
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends git ca-certificates postgresql-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv \
+    && useradd --create-home --shell /usr/sbin/nologin gazette
+
+USER gazette
+WORKDIR /home/gazette
+RUN git clone https://github.com/okfn-brasil/querido-diario.git src \
+    && git -C src checkout "${QD_SPIDERS_REF}" \
+    && uv sync --frozen --no-dev --project src/querido_diario_raspadores
+
+WORKDIR /home/gazette/src/querido_diario_raspadores
+ENV PATH="/home/gazette/src/querido_diario_raspadores/.venv/bin:${PATH}"
+CMD ["scrapy", "list"]
